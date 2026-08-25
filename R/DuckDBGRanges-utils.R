@@ -3546,10 +3546,19 @@ function(x, y, ignore.strand = FALSE)
 
 # Helper function to add keycol-based row indices to a connection
 # This ensures row indices match the iteration order of DuckDBGRanges
+#' @importFrom DuckDBDataFrame has_row_number
+#' @importFrom dbplyr window_order
+#' @importFrom dplyr mutate
+#' @importFrom stats setNames
 .add_keycol_indices <- function(conn, frame, db_conn, idx_name, prefix = "") {
     keycol_name <- names(frame@keycols)[1L]
     keycol_vals <- frame@keycols[[1L]]
-    
+
+    if (has_row_number(frame)) {
+        rank_expr <- call("row_number", as.name(keycol_name))
+        return(mutate(conn, !!!setNames(list(rank_expr), idx_name)))
+    }
+
     # Create mapping dataframe
     mapping_df <- data.frame(
         keycol_val = keycol_vals,
@@ -3637,7 +3646,7 @@ function(x, y, ignore.strand = FALSE)
 .build_nearest_single_result <- function(result_df, n_x) {
     out <- rep(NA_integer_, n_x)
     if (nrow(result_df) > 0) {
-        out[result_df$x_idx] <- as.integer(result_df$subj_idx)
+        out[as.integer(result_df$x_idx)] <- as.integer(result_df$subj_idx)
     }
     out
 }
@@ -3688,7 +3697,8 @@ function(x, y, ignore.strand = FALSE)
                     0L)
     )
     joined <- mutate(joined, !!!dist_expr)
-
+    joined <- filter(joined,
+                     !!!list(call("!", call("is.na", as.name("subj_idx")))))
     joined <- group_by(joined, !!!list(as.name("x_idx")))
     min_dists <- summarize(joined,
                            !!!list(min_dist = call("min", as.name("dist"), na.rm = TRUE)))

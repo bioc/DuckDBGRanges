@@ -1,3 +1,42 @@
+# DuckDBGRanges 0.99.6
+
+## Bug fixes
+
+- `nearest()`, `precede()`, `follow()`, and `distanceToNearest()` returned
+  all-`NA` (or an empty `Hits`) for any `DuckDBGRanges` that does not carry an
+  explicit keycol, which is the default for an object built from a plain file.
+  Three separate defects were stacked here; the first two masked the third.
+  - `.add_keycol_indices()` treated the `keycols` slot as a set of literal key
+    values and inner-joined the table against them. A row-number-keyed frame
+    does not store key values there: it stores the `c(NA, -n)` sentinel
+    returned by `set_row_number()`. The join therefore matched nothing and
+    silently emptied the result rather than erroring. The row position is now
+    derived directly instead. Note that the frame's own `row_number` column
+    cannot be used as the index as-is, since a subset keeps the parent's
+    numbering (`g[3:4]` carries `3`, `4` for what are now positions `1` and
+    `2`); a row-number-keyed object always iterates in ascending `row_number`
+    order, so ranking over that column yields the required `1..n` position.
+  - `.build_nearest_single_result()` used the collected index directly as a
+    subscript. Now that the index is computed in SQL it arrives as
+    `integer64`, and subsetting with an `integer64` vector silently returns
+    `NA` for every position instead of indexing. (The `Hits`-building path was
+    unaffected only because it already coerced with `as.integer()`.)
+  - `nearest()` lacked the `is.na()` guard on the joined subject index that
+    `distanceToNearest()` already had. The setup left-joins on seqnames, so a
+    query range on a seqname with no subject produces a row whose subject
+    bounds are `NULL`; because DuckDB's `greatest()` *skips* nulls rather than
+    propagating them, `greatest(NULL, NULL, 0)` is `0`, so that row scored a
+    perfect distance, won its own minimum-distance filter, and yielded a hit
+    to a `NULL` subject. The directional `precede()`/`follow()` paths were
+    never affected, as their validity comparisons against a `NULL` bound
+    evaluate to `NULL` and drop the row.
+
+  Every pre-existing test in this family supplied an explicit keycol, which is
+  why none of this was covered. Reported in part as item R-G2 of the
+  six-architect cross-engine parity review; the other two defects were found
+  while reproducing it. All four generics are now checked against
+  `GenomicRanges` for both keying modes.
+
 # DuckDBGRanges 0.99.5
 
 ## New features

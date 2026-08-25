@@ -3132,6 +3132,67 @@ test_that("precede/follow select='all' returns only nearest-distance ties", {
     expect_equal(subjectHits(fd), subjectHits(fb))  # only subject 3 (nearest)
 })
 
+test_that("the nearest family works on row-number-keyed objects (no explicit keycol)", {
+    # Every other test in this family passes an explicit keycol. A
+    # DuckDBGRanges built from a plain file has none, and its 'keycols' slot
+    # then holds set_row_number()'s c(NA, -n) sentinel rather than literal key
+    # values, which .add_keycol_indices() must not treat as a join table.
+    q <- .gr_to_ddb(GRanges(c("chr1", "chr2", "chr1"),
+                            IRanges(c(10L, 10L, 200L), c(20L, 20L, 210L)),
+                            strand = "*"))
+    s <- .gr_to_ddb(GRanges("chr1", IRanges(c(100L, 300L), c(100L, 300L)),
+                            strand = "*"))
+    expect_false(is.null(q@frame@keycols[["row_number"]]))
+
+    qb <- as(q, "GRanges")
+    sb <- as(s, "GRanges")
+
+    expect_equal(nearest(q, s, select = "arbitrary"),
+                 nearest(qb, sb, select = "arbitrary"))
+    expect_equal(precede(q, s), precede(qb, sb))
+    expect_equal(follow(q, s), follow(qb, sb))
+
+    nd <- nearest(q, s, select = "all")
+    nb <- nearest(qb, sb, select = "all")
+    expect_equal(queryHits(nd), queryHits(nb))
+    expect_equal(subjectHits(nd), subjectHits(nb))
+
+    dd <- distanceToNearest(q, s)
+    db <- distanceToNearest(qb, sb)
+    expect_equal(queryHits(dd), queryHits(db))
+    expect_equal(subjectHits(dd), subjectHits(db))
+    expect_equal(mcols(dd)$distance, mcols(db)$distance)
+})
+
+test_that("nearest() ignores no-match rows rather than scoring them distance 0", {
+    # The setup left-joins on seqnames, so a query on a seqname with no subject
+    # yields a row with NULL subj_*. DuckDB's greatest() skips NULLs, so
+    # greatest(NULL, NULL, 0) is 0: without an explicit is.na(subj_idx) guard
+    # that row scores a perfect distance and wins its own min-distance filter,
+    # producing a hit to a NULL subject.
+    q <- .gr_to_ddb(GRanges(c("chr1", "chr2"), IRanges(c(10L, 10L), c(20L, 20L)),
+                            strand = "*"),
+                    keycol = seq_len(2L))
+    s <- .gr_to_ddb(GRanges("chr1", IRanges(100L, 100L), strand = "*"),
+                    keycol = 1L)
+    qb <- as(q, "GRanges")
+    sb <- as(s, "GRanges")
+
+    # chr2 has no subject at all: base reports NA, and no hit for it.
+    expect_equal(nearest(q, s, select = "arbitrary"),
+                 nearest(qb, sb, select = "arbitrary"))
+    expect_true(is.na(nearest(q, s, select = "arbitrary")[2L]))
+
+    nd <- nearest(q, s, select = "all")
+    expect_equal(queryHits(nd), queryHits(nearest(qb, sb, select = "all")))
+    expect_equal(subjectHits(nd), subjectHits(nearest(qb, sb, select = "all")))
+    expect_false(any(is.na(subjectHits(nd))))
+
+    # ignore.strand keeps the phantom row alive through the strand filter too.
+    expect_equal(nearest(q, s, select = "arbitrary", ignore.strand = TRUE),
+                 nearest(qb, sb, select = "arbitrary", ignore.strand = TRUE))
+})
+
 test_that("distance() returns NA for incompatible strands or seqnames", {
     # base GenomicRanges::distance: NA on different seqnames, or (unless
     # ignore.strand) on '+' vs '-'; '*' matches any strand. Length-1 ranges keep
