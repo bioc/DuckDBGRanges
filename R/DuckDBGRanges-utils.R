@@ -1820,45 +1820,121 @@ function(x, table, nomatch = NA_integer_, incomparables = NULL,
          check = FALSE)
 }
 
-# Helper to create a DuckDBGRanges from joined x and y connections
-#' @importFrom DuckDBDataFrame tblconn
-.parallel_set_op <- function(x, y, ignore.strand, new_start_expr, new_end_expr)
+# Shared engine for the element-wise (parallel) set operations.
+#
+# 'incompatible' selects what base does when x[i] and y[i] cannot be combined
+# (different seqnames, or an incompatible strand): punion() errors, pintersect()
+# returns a zero-width range. 'require_contiguous' is punion()'s no-gap rule,
+# which it applies unless fill.gap = TRUE. 'strict_strand' tightens strand
+# compatibility so '*' no longer matches '+'/'-', and 'drop_nohit' removes the
+# zero-width results entirely, both of which are pintersect() arguments.
+#
+# The zero-width sentinel base uses is (start(x), start(x) - 1), which is also
+# the clamp applied when the supplied expressions would otherwise produce a
+# negative width (a non-overlapping pintersect).
+#' @importFrom DuckDBDataFrame dbconn tblconn
+#' @importFrom S4Vectors isTRUEorFALSE
+#' @importFrom dplyr filter if_else inner_join mutate pull select summarize
+.parallel_set_op <- function(x, y, ignore.strand, new_start_expr, new_end_expr,
+                             incompatible = c("error", "empty"),
+                             require_contiguous = FALSE,
+                             strict_strand = FALSE,
+                             drop_nohit = FALSE)
 {
+    incompatible <- match.arg(incompatible)
+
     if (length(x) != length(y))
         stop("'x' and 'y' must have the same length")
+
+    if (!isTRUEorFALSE(ignore.strand))
+        stop("'ignore.strand' must be TRUE or FALSE")
 
     if (length(x) == 0L)
         return(x)
 
-    # Get connections with row indices
-    row_idx_mutate <- setNames(list(call("row_number")), ".row_idx")
-    x_conn <- tblconn(x@frame)
-    x_conn <- mutate(x_conn, !!!row_idx_mutate)
+    x_frame <- x@frame
+    x_conn <- tblconn(x_frame)
+    db_conn <- dbconn(x_frame)
 
-    y_conn <- tblconn(y@frame)
-    y_conn <- mutate(y_conn, !!!row_idx_mutate)
+    y_frame <- y@frame
+    y_conn <- tblconn(y_frame)
+
+    # Pair x[i] with y[i] by each object's own recorded key rather than a bare
+    # row_number() over DuckDB's undefined scan order.
+    x_conn <- .add_keycol_indices(x_conn, x_frame, db_conn, ".row_idx", "pset_x")
+    y_conn <- .add_keycol_indices(y_conn, y_frame, db_conn, ".row_idx", "pset_y")
     y_select_list <- setNames(
         lapply(c(".row_idx", "seqnames", "start", "end", "strand"), as.name),
         c(".row_idx", "y_seqnames", "y_start", "y_end", "y_strand"))
     y_conn <- select(y_conn, !!!y_select_list)
 
-    # Join on row index
     joined <- inner_join(x_conn, y_conn, by = ".row_idx", copy = TRUE)
 
-    # Apply the new start/end expressions
-    # new_width = new_end - new_start + 1
-    new_width_expr <- call("+", call("-", as.name("new_end"), as.name("new_start")), 1L)
-    coord_mutate <- list(new_start = new_start_expr, new_end = new_end_expr,
-                         new_width = new_width_expr)
-    joined <- mutate(joined, !!!coord_mutate)
+    # The strand sub-expression is parenthesized explicitly because dbplyr does
+    # not parenthesize a '|' operand of '&' on its own (see pgap()).
+    and2 <- function(a, b) call("&", call("(", a), call("(", b))
+    compat_expr <- call("==", as.name("seqnames"), as.name("y_seqnames"))
+    if (!ignore.strand) {
+        strand_ok <- if (strict_strand) {
+            call("==", as.name("strand"), as.name("y_strand"))
+        } else {
+            call("(", call("|",
+                call("|", call("==", as.name("strand"), "*"),
+                          call("==", as.name("y_strand"), "*")),
+                call("==", as.name("strand"), as.name("y_strand"))))
+        }
+        compat_expr <- and2(compat_expr, strand_ok)
+    }
+    joined <- mutate(joined, compatible = !!compat_expr)
 
-    # Select and rename to standard columns
+    if (incompatible == "error") {
+        n_bad_expr <- call("sum", call("as.integer",
+                                       call("!", as.name("compatible"))),
+                           na.rm = TRUE)
+        n_bad <- pull(summarize(joined, !!!setNames(list(n_bad_expr), "n_bad")))
+        if (isTRUE(n_bad > 0L))
+            stop("'x' and 'y' elements must have compatible 'seqnames' and ",
+                 "'strand' values")
+    }
+
+    if (require_contiguous) {
+        gap_expr <- call("(", call("|",
+            call(">", as.name("y_start"), call("+", as.name("end"), 1L)),
+            call(">", as.name("start"), call("+", as.name("y_end"), 1L))))
+        n_gap_expr <- call("sum", call("as.integer", gap_expr), na.rm = TRUE)
+        n_gap <- pull(summarize(joined, !!!setNames(list(n_gap_expr), "n_gap")))
+        if (isTRUE(n_gap > 0L))
+            stop("some pair of ranges have a gap within the 2 members of ",
+                 "the pair; use 'fill.gap=TRUE' to span it")
+    }
+
+    joined <- mutate(joined, !!!list(cand_start = new_start_expr,
+                                     cand_end = new_end_expr))
+    empty_expr <- call("|", call("!", as.name("compatible")),
+                       call("<", as.name("cand_end"), as.name("cand_start")))
+    joined <- mutate(joined, is_empty = !!empty_expr)
+    joined <- mutate(joined, !!!list(
+        new_start = call("if_else", as.name("is_empty"),
+                         as.name("start"), as.name("cand_start")),
+        new_end = call("if_else", as.name("is_empty"),
+                       call("-", as.name("start"), 1L), as.name("cand_end"))))
+
+    if (drop_nohit)
+        joined <- filter(joined, !!!list(call("!", as.name("is_empty"))))
+
+    new_width_expr <- call("+", call("-", as.name("new_end"),
+                                     as.name("new_start")), 1L)
+    joined <- mutate(joined, new_width = !!new_width_expr)
+
+    # Retain .row_idx so the result keeps the x[i]/y[i] pairing order;
+    # .build_DuckDBGRanges()'s default coordinate sort would permute it.
     select_rename_list <- setNames(
-        lapply(c("seqnames", "strand", "new_start", "new_end", "new_width"), as.name),
-        c("seqnames", "strand", "start", "end", "width"))
+        lapply(c(".row_idx", "seqnames", "strand", "new_start", "new_end",
+                 "new_width"), as.name),
+        c(".row_idx", "seqnames", "strand", "start", "end", "width"))
     joined <- select(joined, !!!select_rename_list)
 
-    .build_DuckDBGRanges(joined, seqinfo(x))
+    .build_DuckDBGRanges(joined, seqinfo(x), order_by = list(as.name(".row_idx")))
 }
 
 #' @export
@@ -1868,17 +1944,17 @@ function(x, table, nomatch = NA_integer_, incomparables = NULL,
 setMethod("punion", c("DuckDBGRanges", "DuckDBGRanges"),
 function(x, y, fill.gap = FALSE, ignore.strand = FALSE)
 {
-    if (!fill.gap) {
-        # Without fill.gap, ranges must overlap or be adjacent
-        # For simplicity, we still compute the union but don't validate overlap
-        # (the standard method also doesn't strictly enforce this for all cases)
-    }
+    if (!isTRUEorFALSE(fill.gap))
+        stop("'fill.gap' must be TRUE or FALSE")
 
-    # punion: new_start = min(x_start, y_start), new_end = max(x_end, y_end)
+    # punion: new_start = min(x_start, y_start), new_end = max(x_end, y_end).
+    # Base refuses a pair it cannot combine, and (unless fill.gap) a pair with
+    # a gap between its members, rather than silently spanning it.
     new_start_expr <- call("least", as.name("start"), as.name("y_start"))
     new_end_expr <- call("greatest", as.name("end"), as.name("y_end"))
 
-    .parallel_set_op(x, y, ignore.strand, new_start_expr, new_end_expr)
+    .parallel_set_op(x, y, ignore.strand, new_start_expr, new_end_expr,
+                     incompatible = "error", require_contiguous = !fill.gap)
 })
 
 #' @export
@@ -1906,11 +1982,22 @@ setMethod("pintersect", c("DuckDBGRanges", "DuckDBGRanges"),
 function(x, y, drop.nohit.ranges = FALSE, ignore.strand = FALSE,
          strict.strand = FALSE)
 {
-    # pintersect: new_start = max(x_start, y_start), new_end = min(x_end, y_end)
+    if (!isTRUEorFALSE(drop.nohit.ranges))
+        stop("'drop.nohit.ranges' must be TRUE or FALSE")
+    if (!isTRUEorFALSE(strict.strand))
+        stop("'strict.strand' must be TRUE or FALSE")
+
+    # pintersect: new_start = max(x_start, y_start), new_end = min(x_end, y_end).
+    # Unlike punion(), base does not error on a pair it cannot combine: a
+    # non-overlapping, cross-seqname, or strand-incompatible pair yields a
+    # zero-width range (which .parallel_set_op() clamps to, in place of the
+    # negative width these expressions would otherwise produce).
     new_start_expr <- call("greatest", as.name("start"), as.name("y_start"))
     new_end_expr <- call("least", as.name("end"), as.name("y_end"))
 
-    .parallel_set_op(x, y, ignore.strand, new_start_expr, new_end_expr)
+    .parallel_set_op(x, y, ignore.strand, new_start_expr, new_end_expr,
+                     incompatible = "empty", strict_strand = strict.strand,
+                     drop_nohit = drop.nohit.ranges)
 })
 
 #' @export
@@ -2086,16 +2173,20 @@ function(x, y, ignore.strand = FALSE, ...)
     # incompatible pairs can be set to NA (base GenomicRanges::distance returns NA
     # for a pair on different seqnames, or — unless ignore.strand — on '+' vs '-';
     # '*' matches any strand).
-    row_idx_mutate <- setNames(list(call("row_number")), ".row_idx")
-    x_conn <- tblconn(x@frame)
-    x_conn <- mutate(x_conn, !!!row_idx_mutate)
+    # Pair x[i] with y[i] by each object's own recorded key rather than a bare
+    # row_number() over DuckDB's undefined scan order.
+    x_frame <- x@frame
+    db_conn <- dbconn(x_frame)
+    x_conn <- .add_keycol_indices(tblconn(x_frame), x_frame, db_conn,
+                                  ".row_idx", "distance_x")
     x_select_list <- setNames(
         lapply(c(".row_idx", "seqnames", "strand", "start", "end"), as.name),
         c(".row_idx", "x_seqnames", "x_strand", "x_start", "x_end"))
     x_conn <- select(x_conn, !!!x_select_list)
 
-    y_conn <- tblconn(y@frame)
-    y_conn <- mutate(y_conn, !!!row_idx_mutate)
+    y_frame <- y@frame
+    y_conn <- .add_keycol_indices(tblconn(y_frame), y_frame, db_conn,
+                                  ".row_idx", "distance_y")
     y_select_list <- setNames(
         lapply(c(".row_idx", "seqnames", "strand", "start", "end"), as.name),
         c(".row_idx", "y_seqnames", "y_strand", "y_start", "y_end"))
@@ -2116,12 +2207,19 @@ function(x, y, ignore.strand = FALSE, ...)
     if (ignore.strand) {
         valid_expr <- same_seq
     } else {
-        strand_ok <- call("|",
+        # The '|' chain must be parenthesized explicitly: dbplyr does not
+        # parenthesize a '|' operand of '&' on its own, so this rendered as
+        # "same_seq AND eq OR x='*' OR y='*'". Under SQL's precedence that
+        # made any pair with a '*' strand valid regardless of seqname, so
+        # distance() returned a number for ranges on different chromosomes
+        # instead of NA (see the same note on pgap()).
+        strand_ok <- call("(",
                           call("|",
-                               call("==", as.name("x_strand"), as.name("y_strand")),
-                               call("==", as.name("x_strand"), "*")),
-                          call("==", as.name("y_strand"), "*"))
-        valid_expr <- call("&", same_seq, strand_ok)
+                               call("|",
+                                    call("==", as.name("x_strand"), as.name("y_strand")),
+                                    call("==", as.name("x_strand"), "*")),
+                               call("==", as.name("y_strand"), "*")))
+        valid_expr <- call("&", call("(", same_seq), strand_ok)
     }
     dist_expr <- call("if_else", valid_expr, gap_expr, NA_integer_)
     dist_mutate <- list(dist = dist_expr)

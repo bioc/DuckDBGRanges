@@ -71,6 +71,45 @@
   shape the old code got right; all four shapes are now checked against
   `GenomicRanges` for both keying modes and both `ignore.strand` settings.
 
+- `punion()` and `pintersect()` shared the same defects `psetdiff()` had,
+  through their common `.parallel_set_op()` engine, and base treats the two
+  differently in a way that was not modelled at all:
+  - `pintersect()` on a pair that does not overlap produced a **negative
+    width**, which is unmaterializable (`each range must have a non-negative
+    width`). Base returns a zero-width range at `(start(x), start(x) - 1)`,
+    which is now the clamp applied whenever the coordinate expressions would
+    invert.
+  - `punion()` silently spanned a gap between the two members of a pair.
+    Base errors unless `fill.gap = TRUE`.
+  - `seqnames` and `strand` compatibility were not checked, so both
+    operations combined ranges across different chromosomes. Base refuses
+    such a pair outright in `punion()`, and returns the zero-width range in
+    `pintersect()`.
+  - `ignore.strand` was accepted and never used, as were `pintersect()`'s
+    `strict.strand` (which tightens compatibility so `*` no longer matches
+    `+`/`-`) and `drop.nohit.ranges` (which removes the zero-width results).
+    All three are now honoured and validated.
+  - Results were coordinate-sorted, so `result[i]` was not `x[i]` combined
+    with `y[i]`. They are now ordered by the pairing index.
+
+- `distance(x, y)` returned a number instead of `NA` for a pair on different
+  seqnames whenever either strand was `*`. The strand `|` chain was not
+  parenthesized inside the `&`, and dbplyr does not add the parentheses
+  itself, so under SQL's precedence the rendered predicate reduced to
+  "same seqname AND strands equal OR x is `*` OR y is `*`" and any `*` strand
+  made the pair valid on its own. The pre-existing test missed it because it
+  never combined a seqname mismatch with a `*` strand. This is the same
+  hazard already documented on `pgap()`.
+
+- The remaining element-wise operations (`punion()`, `pintersect()`, and
+  `distance()`) now pair `x[i]` with `y[i]` through each object's recorded
+  key rather than a bare `row_number()` over DuckDB's undefined scan order,
+  completing the correction the `pgap()` rewrite began and `psetdiff()`
+  continued. Reported as item R-G4 of the six-architect cross-engine parity
+  review; the correctness defects above were found while fixing it. All
+  three are now checked against `GenomicRanges` with and without an explicit
+  keycol.
+
 ## Internal changes
 
 - `case_when` is now declared in the `@importFrom` tags of `trim()`,

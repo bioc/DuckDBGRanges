@@ -3271,6 +3271,90 @@ test_that("nearest() ignores no-match rows rather than scoring them distance 0",
                  nearest(qb, sb, select = "arbitrary", ignore.strand = TRUE))
 })
 
+test_that("punion refuses pairs base refuses, and honours fill.gap", {
+    mk <- function(s, e, sq = "chr1", st = "*")
+        .gr_to_ddb(GRanges(sq, IRanges(s, e), strand = st), keycol = 1L)
+    ok <- punion(mk(10L, 20L), mk(15L, 25L))
+    expect_identical(start(as(ok, "GRanges")), 10L)
+    expect_identical(end(as(ok, "GRanges")), 25L)
+
+    # a gap between the pair is an error unless fill.gap spans it
+    expect_error(punion(mk(10L, 20L), mk(50L, 60L)), "gap")
+    filled <- as(punion(mk(10L, 20L), mk(50L, 60L), fill.gap = TRUE), "GRanges")
+    expect_identical(c(start(filled), end(filled)), c(10L, 60L))
+
+    # incompatible pairs are refused, not silently combined
+    expect_error(punion(mk(10L, 20L), mk(15L, 25L, sq = "chr2")), "compatible")
+    expect_error(punion(mk(10L, 20L, st = "+"), mk(15L, 25L, st = "-")),
+                 "compatible")
+    ig <- as(punion(mk(10L, 20L, st = "+"), mk(15L, 25L, st = "-"),
+                    ignore.strand = TRUE), "GRanges")
+    expect_identical(c(start(ig), end(ig)), c(10L, 25L))
+})
+
+test_that("pintersect returns zero width, never a negative one", {
+    mk <- function(s, e, sq = "chr1", st = "*")
+        .gr_to_ddb(GRanges(sq, IRanges(s, e), strand = st), keycol = 1L)
+    zero <- function(a, b, ...) {
+        r <- as(pintersect(a, b, ...), "GRanges")
+        c(start(r), end(r), width(r))
+    }
+    # a non-overlapping pair used to produce a negative width, which is not
+    # merely wrong but unmaterializable
+    expect_identical(zero(mk(10L, 20L), mk(50L, 60L)), c(10L, 9L, 0L))
+    # base does not error on an incompatible pair here (unlike punion); it
+    # returns the same zero-width range
+    expect_identical(zero(mk(10L, 20L), mk(15L, 25L, sq = "chr2")),
+                     c(10L, 9L, 0L))
+    expect_identical(zero(mk(10L, 20L, st = "+"), mk(15L, 25L, st = "-")),
+                     c(10L, 9L, 0L))
+    # strict.strand stops '*' from matching '+'
+    expect_identical(zero(mk(10L, 20L, st = "+"), mk(15L, 25L, st = "*")),
+                     c(15L, 20L, 6L))
+    expect_identical(zero(mk(10L, 20L, st = "+"), mk(15L, 25L, st = "*"),
+                          strict.strand = TRUE), c(10L, 9L, 0L))
+    # drop.nohit.ranges removes the zero-width results outright
+    expect_length(pintersect(mk(10L, 20L), mk(50L, 60L),
+                             drop.nohit.ranges = TRUE), 0L)
+})
+
+test_that("parallel set ops are positional and work without an explicit keycol", {
+    xs <- GRanges("chr1", IRanges(c(500L, 100L, 300L), c(510L, 110L, 310L)))
+    ys <- GRanges("chr1", IRanges(c(505L, 105L, 305L), c(520L, 120L, 320L)))
+    for (keyed in c(FALSE, TRUE)) {
+        kx <- if (keyed) seq_along(xs) else NULL
+        q <- .gr_to_ddb(xs, keycol = kx)
+        s <- .gr_to_ddb(ys, keycol = kx)
+        qb <- as(q, "GRanges"); sb <- as(s, "GRanges")
+
+        got <- as(punion(q, s), "GRanges")
+        want <- punion(qb, sb)
+        expect_identical(start(got), start(want))
+        expect_identical(end(got), end(want))
+
+        goti <- as(pintersect(q, s), "GRanges")
+        wanti <- pintersect(qb, sb)
+        expect_identical(start(goti), start(wanti))
+        expect_identical(end(goti), end(wanti))
+
+        expect_identical(distance(q, s), distance(qb, sb))
+    }
+})
+
+test_that("distance() is NA across seqnames even when a strand is '*'", {
+    # The strand OR-chain was not parenthesized inside the AND, so SQL
+    # precedence made any pair with a '*' strand "valid" regardless of
+    # seqname, and distance() returned a number for different chromosomes.
+    one <- function(sq, st)
+        .gr_to_ddb(GRanges(sq, IRanges(1L, 10L), strand = st), keycol = 1L)
+    two <- function(sq, st)
+        .gr_to_ddb(GRanges(sq, IRanges(20L, 30L), strand = st), keycol = 1L)
+    expect_true(is.na(distance(one("chr1", "+"), two("chr2", "*"))))
+    expect_true(is.na(distance(one("chr1", "*"), two("chr2", "+"))))
+    expect_true(is.na(distance(one("chr1", "*"), two("chr2", "*"))))
+    expect_equal(distance(one("chr1", "+"), two("chr1", "*")), 9L)
+})
+
 test_that("distance() returns NA for incompatible strands or seqnames", {
     # base GenomicRanges::distance: NA on different seqnames, or (unless
     # ignore.strand) on '+' vs '-'; '*' matches any strand. Length-1 ranges keep
