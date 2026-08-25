@@ -750,6 +750,51 @@ test_that("narrow works for DuckDBGRanges", {
     checkDuckDBGRanges(result_ddb_ns, result_gr_ns)
 })
 
+test_that("narrow refuses an unsolvable start/end/width request", {
+    q <- .gr_to_ddb(GRanges("chr1", IRanges(100L, 200L)), keycol = 1L)
+    # A width fixes whichever side was left NA, so exactly one of start/end
+    # must be NA: "width only" has nothing to anchor to, and supplying all
+    # three is over-determined. Base refuses both.
+    expect_error(narrow(q, width = 10L), "must be NA")
+    expect_error(narrow(q, start = 5L, end = 50L, width = 10L), "must be NA")
+    expect_error(narrow(as(q, "GRanges"), width = 10L))
+})
+
+test_that("narrow refuses to widen or invert a range", {
+    # narrow() may only shrink. These previously returned a range extending
+    # past the original instead of erroring.
+    q <- .gr_to_ddb(GRanges("chr1", IRanges(100L, 200L)), keycol = 1L)
+    expect_error(narrow(q, start = 5L, end = 200L), "widen or invert")
+    expect_error(narrow(q, start = 500L), "widen or invert")
+    expect_error(narrow(q, start = -20L, end = 50L), "widen or invert")
+    expect_error(narrow(as(q, "GRanges"), start = 5L, end = 200L))
+
+    # the check is per row: this is legal for the wide range but not the narrow
+    # one, and base rejects the whole call
+    multi <- .gr_to_ddb(
+        GRanges("chr1", IRanges(c(100L, 10L), c(200L, 15L))),
+        keycol = seq_len(2L))
+    expect_error(narrow(multi, start = -10L), "widen or invert")
+    expect_error(narrow(as(multi, "GRanges"), start = -10L))
+})
+
+test_that("narrow matches base across the solvable start/end/width forms", {
+    gr <- GRanges("chr1", IRanges(c(100L, 10L, 500L), c(200L, 60L, 505L)))
+    q <- .gr_to_ddb(gr, keycol = seq_along(gr))
+    qb <- as(q, "GRanges")
+    forms <- list(list(start = 5L), list(end = -5L), list(start = 1L),
+                  list(end = -1L), list(start = 5L, end = 4L))
+    for (f in forms) {
+        got <- as(do.call(narrow, c(list(q), f)), "GRanges")
+        want <- do.call(narrow, c(list(qb), f))
+        expect_identical(start(got), start(want))
+        expect_identical(end(got), end(want))
+        expect_identical(width(got), width(want))
+        # the width column must agree with the coordinates it is derived from
+        expect_identical(width(got), end(got) - start(got) + 1L)
+    }
+})
+
 test_that("resize works for DuckDBGRanges", {
     ddb_gr <- DuckDBGRanges(granges_tf, seqnames = "seqnames",
                             start = "start", end = "end", strand = "strand",

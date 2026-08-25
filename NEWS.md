@@ -110,6 +110,29 @@
   three are now checked against `GenomicRanges` with and without an explicit
   keycol.
 
+- `narrow()` silently accepted requests base refuses, and in two of them
+  returned a range **wider** than the one it was given, which is the opposite
+  of what the function is for.
+  - A supplied `width` fixes whichever side was left `NA`, so exactly one of
+    `start`/`end` must be `NA`. `narrow(x, width = w)` on its own had nothing
+    to anchor to and quietly anchored at the start, and supplying all three
+    of `start`/`end`/`width` quietly ignored `end`. Both now error, as in
+    base.
+  - `narrow()` may only shrink a range (base solves the request with
+    `allow.nonnarrowing = FALSE`), and may not invert one. Requests such as
+    `narrow(x, start = 5, end = 200)` on a 101-wide range previously returned
+    `104-299`, extending well past the original. These now error. The check is
+    per row, matching base, so it also catches a request that is legal for
+    some ranges in the object but not others; it costs one aggregate query.
+
+  The review reported this as item R-G3, described as `narrow(width = w)`
+  leaving the coordinates unchanged while writing an inconsistent `width`.
+  That part does not reproduce: `.modify_DuckDBGRanges_datacols()` recomputes
+  `end` as `start + width - 1` whenever only the width changes, so the object
+  stays self-consistent. The real divergence is the missing validation above.
+  Every solvable form of the call already agreed with `GenomicRanges` and
+  still does.
+
 ## Internal changes
 
 - `case_when` is now declared in the `@importFrom` tags of `trim()`,

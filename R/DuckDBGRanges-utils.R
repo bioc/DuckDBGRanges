@@ -1116,8 +1116,40 @@ function(x, shift = 0L, use.names = TRUE)
     .modify_DuckDBGRanges_datacols(x, new_start = new_start, new_end = new_end)
 })
 
+# Resolve narrow()'s (start, end, width) request into new start/end expressions
+# in terms of the supplied start/end operands. Base IRanges (solveUserSEW)
+# treats a NEGATIVE start or end as a position counting back from the range end
+# (-1 is the last base); a positive one counts from the start. A supplied width
+# fixes whichever side was left NA. Either element of the result may be NULL,
+# meaning "unchanged".
+#
+# It is called twice per narrow(): once with the frame's datacol expressions to
+# build the new columns, and once with the plain coordinate names to build the
+# validation predicate against the lazy table, where those datacols are exposed
+# under their own names.
+.narrow_resolve <- function(start_op, end_op, s, e, w) {
+    ns <- NULL
+    ne <- NULL
+    if (!is.na(s))
+        ns <- if (s < 0L) call("+", end_op, s + 1L) else
+            call("+", start_op, s - 1L)
+    if (!is.na(e))
+        ne <- if (e < 0L) call("+", end_op, e + 1L) else
+            call("-", call("+", start_op, e), 1L)
+    if (!is.na(w)) {
+        if (!is.na(s)) {
+            ne <- call("+", ns, w - 1L)
+        } else if (!is.na(e)) {
+            ns <- call("-", ne, w - 1L)
+        }
+    }
+    list(start = ns, end = ne)
+}
+
 #' @export
+#' @importFrom DuckDBDataFrame tblconn
 #' @importFrom IRanges narrow
+#' @importFrom dplyr mutate pull summarize
 setMethod("narrow", "DuckDBGRanges",
 function(x, start = NA, end = NA, width = NA, use.names = TRUE)
 {
@@ -1141,26 +1173,39 @@ function(x, start = NA, end = NA, width = NA, use.names = TRUE)
     if (is.na(s) && is.na(e) && is.na(w))
         return(x)
 
-    # New start/end as `column +/- scalar` (NULL = unchanged).
-    new_start <- NULL
-    new_end <- NULL
-    if (!is.na(s))
-        new_start <- if (s < 0L) call("+", old_end, s + 1L) else
-            call("+", old_start, s - 1L)
-    if (!is.na(e))
-        new_end <- if (e < 0L) call("+", old_end, e + 1L) else
-            call("-", call("+", old_start, e), 1L)
+    # A supplied width fixes whichever side was left NA, so exactly one of
+    # start/end must be NA for the request to be solvable. Base refuses both
+    # "width only" (nothing to anchor to) and "start, end and width together"
+    # (over-determined) with this message.
+    if (!is.na(w) && (is.na(s) == is.na(e)))
+        stop("either the supplied start or the supplied end (but not both) ",
+             "must be NA when the supplied width is not NA")
 
-    # A given width fixes the missing side; anchor at the already-resolved start
-    # (or end). Adding a scalar to `new_start`, or subtracting a scalar from
-    # `new_end`, keeps the expression `column +/- scalar` (safe).
-    if (!is.na(w)) {
-        if (!is.na(s)) {
-            new_end <- call("+", new_start, w - 1L)   # new_start + (w-1)
-        } else if (!is.na(e)) {
-            new_start <- call("-", new_end, w - 1L)   # new_end - (w-1)
-        }
-    }
+    # New start/end as `column +/- scalar` (NULL = unchanged).
+    resolved <- .narrow_resolve(old_start, old_end, s, e, w)
+    new_start <- resolved[["start"]]
+    new_end <- resolved[["end"]]
+
+    # narrow() may only ever shrink a range: base's solveUserSEW runs with
+    # allow.nonnarrowing = FALSE, and also refuses a request that would invert
+    # the range. Both depend on each row's own coordinates, so they cost one
+    # aggregate query; without it a request that overshoots silently returned a
+    # range extending past the original instead of erroring.
+    chk <- .narrow_resolve(as.name("start"), as.name("end"), s, e, w)
+    ns_chk <- chk[["start"]] %||% as.name("start")
+    ne_chk <- chk[["end"]] %||% as.name("end")
+    bad_expr <- call("|",
+        call("(", call("|",
+            call("<", ns_chk, as.name("start")),
+            call(">", ne_chk, as.name("end")))),
+        call("(", call("<", ne_chk, call("-", ns_chk, 1L))))
+    conn <- mutate(tblconn(frame), .narrow_bad = !!bad_expr)
+    n_bad <- pull(summarize(conn, !!!setNames(list(
+        call("sum", call("as.integer", as.name(".narrow_bad")), na.rm = TRUE)),
+        "n_bad")))
+    if (isTRUE(n_bad > 0L))
+        stop("the supplied 'start'/'end'/'width' would widen or invert ",
+             "at least one range; narrow() can only make ranges smaller")
 
     # width column. `old_width` is itself the expression `end - start + 1`, so it
     # may only be ADDED to (never subtracted, and never subtract any compound).
