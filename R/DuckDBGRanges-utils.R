@@ -1936,32 +1936,34 @@ function(x, y, drop.nohit.ranges = FALSE, ignore.strand = FALSE,
 })
 
 #' @export
-#' @importFrom DuckDBDataFrame tblconn
+#' @importFrom DuckDBDataFrame dbconn tblconn
 #' @importFrom IRanges psetdiff
-#' @importFrom dplyr case_when inner_join mutate row_number select
+#' @importFrom S4Vectors isTRUEorFALSE
+#' @importFrom dplyr if_else inner_join mutate pull select summarize
 setMethod("psetdiff", c("DuckDBGRanges", "DuckDBGRanges"),
 function(x, y, ignore.strand = FALSE)
 {
-    # psetdiff is complex: x minus y
-    # Result depends on relationship between x and y
-    # For ranges where y overlaps x:
-    # - If y starts at or before x start: result is y_end+1 to x_end
-    # - If y ends at or after x end: result is x_start to y_start-1
-    # This implementation assumes y is fully contained overlap scenario
-    # or edge-aligned (which is the common use case)
-
     if (length(x) != length(y))
         stop("'x' and 'y' must have the same length")
+
+    if (!isTRUEorFALSE(ignore.strand))
+        stop("'ignore.strand' must be TRUE or FALSE")
 
     if (length(x) == 0L)
         return(x)
 
-    row_idx_mutate <- setNames(list(call("row_number")), ".row_idx")
-    x_conn <- tblconn(x@frame)
-    x_conn <- mutate(x_conn, !!!row_idx_mutate)
+    x_frame <- x@frame
+    x_conn <- tblconn(x_frame)
+    db_conn <- dbconn(x_frame)
 
-    y_conn <- tblconn(y@frame)
-    y_conn <- mutate(y_conn, !!!row_idx_mutate)
+    y_frame <- y@frame
+    y_conn <- tblconn(y_frame)
+
+    # Pair x[i] with y[i] by each object's own recorded key rather than a bare
+    # row_number() over DuckDB's undefined scan order (the same correction the
+    # pgap() rewrite made).
+    x_conn <- .add_keycol_indices(x_conn, x_frame, db_conn, ".row_idx", "psetdiff_x")
+    y_conn <- .add_keycol_indices(y_conn, y_frame, db_conn, ".row_idx", "psetdiff_y")
     y_select_list <- setNames(
         lapply(c(".row_idx", "seqnames", "start", "end", "strand"), as.name),
         c(".row_idx", "y_seqnames", "y_start", "y_end", "y_strand"))
@@ -1969,29 +1971,77 @@ function(x, y, ignore.strand = FALSE)
 
     joined <- inner_join(x_conn, y_conn, by = ".row_idx", copy = TRUE)
 
-    # Use CASE WHEN logic for psetdiff
-    # If y_start <= start: new_start = y_end + 1, new_end = end
-    # Else: new_start = start, new_end = y_start - 1
-    # Build case_when expression using call()
-    cond1 <- call("<=", as.name("y_start"), as.name("start"))
-    case_start_expr <- call("case_when",
-        call("~", cond1, call("+", as.name("y_end"), 1L)),
-        call("~", TRUE, as.name("start")))
-    case_end_expr <- call("case_when",
-        call("~", cond1, as.name("end")),
-        call("~", TRUE, call("-", as.name("y_start"), 1L)))
+    # y[i] is subtracted from x[i] only where the two are on the same seqname
+    # and (unless ignore.strand) a compatible strand ('*' matches any strand),
+    # and only where they actually overlap; anything else leaves x[i]
+    # untouched, matching base psetdiff(). The strand sub-expression is
+    # parenthesized explicitly because dbplyr does not parenthesize a '|'
+    # operand of '&' on its own (see pgap() for the same note).
+    compat_expr <- call("==", as.name("seqnames"), as.name("y_seqnames"))
+    if (!ignore.strand) {
+        strand_ok <- call("(", call("|",
+            call("|", call("==", as.name("strand"), "*"),
+                     call("==", as.name("y_strand"), "*")),
+            call("==", as.name("strand"), as.name("y_strand"))))
+        compat_expr <- call("&", compat_expr, strand_ok)
+    }
+    and2 <- function(a, b) call("&", call("(", a), call("(", b))
+    overlaps_expr <- and2(compat_expr,
+        and2(call("<=", as.name("y_start"), as.name("end")),
+             call(">=", as.name("y_end"), as.name("start"))))
+    joined <- mutate(joined, overlaps = !!overlaps_expr)
+
+    # An overlapping pair has one of four shapes, and base psetdiff() treats
+    # them differently:
+    #   left    y covers x's start only   -> (y_end + 1, x_end)
+    #   right   y covers x's end only     -> (x_start, y_start - 1)
+    #   cover   y covers all of x         -> zero width, (x_start, x_start - 1)
+    #   inside  y sits strictly inside x  -> two pieces, so base refuses
+    # Only the first two were handled before, so a non-overlapping pair came
+    # back WIDER than x, and a covering pair came back with negative width.
+    y_le_start <- call("<=", as.name("y_start"), as.name("start"))
+    y_gt_start <- call(">", as.name("y_start"), as.name("start"))
+    y_ge_end   <- call(">=", as.name("y_end"), as.name("end"))
+    y_lt_end   <- call("<", as.name("y_end"), as.name("end"))
+    shape_mutate <- list(
+        is_left   = and2(as.name("overlaps"), and2(y_le_start, y_lt_end)),
+        is_cover  = and2(as.name("overlaps"), and2(y_le_start, y_ge_end)),
+        is_right  = and2(as.name("overlaps"), and2(y_gt_start, y_ge_end)),
+        is_inside = and2(as.name("overlaps"), and2(y_gt_start, y_lt_end)))
+    joined <- mutate(joined, !!!shape_mutate)
+
+    n_bad_expr <- call("sum", call("as.integer", as.name("is_inside")), na.rm = TRUE)
+    n_bad <- pull(summarize(joined, !!!setNames(list(n_bad_expr), "n_bad")))
+    if (isTRUE(n_bad > 0L))
+        stop("some ranges in 'y' have their end points strictly inside the ",
+             "range in 'x' that they need to be subtracted from; ",
+             "cannot subtract them")
+
+    new_start_expr <- call("if_else", as.name("is_left"),
+                           call("+", as.name("y_end"), 1L), as.name("start"))
+    new_end_expr <- call("if_else", as.name("is_cover"),
+                         call("-", as.name("start"), 1L),
+                         call("if_else", as.name("is_right"),
+                              call("-", as.name("y_start"), 1L), as.name("end")))
     new_width_expr <- call("+", call("-", as.name("new_end"), as.name("new_start")), 1L)
 
-    coord_mutate <- list(new_start = case_start_expr, new_end = case_end_expr,
-                         new_width = new_width_expr)
-    joined <- mutate(joined, !!!coord_mutate)
+    joined <- mutate(joined, !!!list(new_start = new_start_expr,
+                                     new_end = new_end_expr))
+    joined <- mutate(joined, new_width = !!new_width_expr)
 
+    # Retain .row_idx so the result can be ordered to match the original
+    # x[i]/y[i] pairing; .build_DuckDBGRanges()'s datacols expression below
+    # doesn't name it, so it never becomes a visible column of the result.
     select_rename_list <- setNames(
-        lapply(c("seqnames", "strand", "new_start", "new_end", "new_width"), as.name),
-        c("seqnames", "strand", "start", "end", "width"))
+        lapply(c(".row_idx", "seqnames", "strand", "new_start", "new_end", "new_width"),
+               as.name),
+        c(".row_idx", "seqnames", "strand", "start", "end", "width"))
     joined <- select(joined, !!!select_rename_list)
 
-    .build_DuckDBGRanges(joined, seqinfo(x))
+    # psetdiff() is positional (result[i] is x[i] minus y[i]): order by the
+    # pairing index rather than .build_DuckDBGRanges()'s default coordinate
+    # sort, which would silently permute the result relative to x/y.
+    .build_DuckDBGRanges(joined, seqinfo(x), order_by = list(as.name(".row_idx")))
 })
 
 #' @export
@@ -2550,7 +2600,7 @@ function(x, start = NA, end = NA, keep.all.ranges = FALSE, use.names = TRUE)
 #' @importFrom DuckDBDataFrame tblconn
 #' @importFrom IRanges reduce
 #' @importFrom dbplyr window_order
-#' @importFrom dplyr mutate filter select arrange group_by summarize ungroup
+#' @importFrom dplyr arrange case_when filter group_by mutate select summarize ungroup
 #' @importFrom S4Vectors new2
 setMethod("reduce", "DuckDBGRanges",
 function(x, drop.empty.ranges = FALSE, min.gapwidth = 1L,
@@ -3337,7 +3387,7 @@ function(x, y, ignore.strand = FALSE)
 #' @export
 #' @importFrom DuckDBDataFrame tblconn
 #' @importFrom dbplyr window_order
-#' @importFrom dplyr arrange distinct filter group_by lag left_join mutate select summarize ungroup union_all
+#' @importFrom dplyr arrange case_when distinct filter group_by lag left_join mutate select summarize ungroup union_all
 #' @importFrom S4Vectors new2
 setMethod("setdiff", c("DuckDBGRanges", "DuckDBGRanges"),
 function(x, y, ignore.strand = FALSE)

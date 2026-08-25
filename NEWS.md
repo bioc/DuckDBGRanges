@@ -37,6 +37,46 @@
   while reproducing it. All four generics are now checked against
   `GenomicRanges` for both keying modes.
 
+- `psetdiff()` handled only one of the four ways `y[i]` can overlap `x[i]`,
+  as its own header comment conceded ("assumes y is fully contained overlap
+  scenario or edge-aligned"). A pair that does not overlap at all came back
+  **wider** than `x`, and a pair where `y` covers `x` came back with a
+  **negative width**, which is not merely a wrong number but unmaterializable
+  (`each range must have a non-negative width`). A `y` sitting strictly
+  inside `x` cannot be expressed as a single range, so base refuses it;
+  this returned nonsense instead. The four shapes now match base:
+  `(y_end + 1, x_end)` for a left-edge overlap, `(x_start, y_start - 1)` for
+  a right-edge one, a zero-width range at `(x_start, x_start - 1)` when `y`
+  covers `x`, an unchanged `x` when the two do not overlap, and an error when
+  `y` falls strictly inside.
+
+  Three further defects in the same method:
+  - `seqnames` and `strand` compatibility were ignored entirely, so ranges
+    were subtracted from one another across different chromosomes. Base
+    leaves `x[i]` untouched whenever the pair cannot be compared.
+  - `ignore.strand` was accepted and then never used. It is now honoured, and
+    validated.
+  - The result was passed through `.build_DuckDBGRanges()`'s default
+    coordinate sort, which silently permuted it: `result[i]` was not
+    `x[i]` minus `y[i]`. As with `pgap()`, the result is now ordered by the
+    pairing index.
+
+  Pairing also moves off a bare `row_number()` over DuckDB's undefined scan
+  order onto `.add_keycol_indices()`, matching the `pgap()` rewrite. That is
+  separately tracked as review item R-G4 for `punion()`/`pintersect()`, but
+  correct pairing is a precondition for this method being correct at all.
+
+  Reported as item R-G1 of the six-architect cross-engine parity review. The
+  pre-existing test covered only left-edge overlaps, which is the single
+  shape the old code got right; all four shapes are now checked against
+  `GenomicRanges` for both keying modes and both `ignore.strand` settings.
+
+## Internal changes
+
+- `case_when` is now declared in the `@importFrom` tags of `trim()`,
+  `restrict()`, `reduce()`, and `setdiff()`, which all use it. They had been
+  relying on the import declared by `psetdiff()`, which no longer needs it.
+
 # DuckDBGRanges 0.99.5
 
 ## New features

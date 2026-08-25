@@ -1130,6 +1130,84 @@ test_that("psetdiff works for DuckDBGRanges", {
     unlink(c(tf1, tf2))
 })
 
+test_that("psetdiff matches base for every overlap shape", {
+    # The pre-existing test above only exercised left-edge overlaps, which is
+    # the one shape the original implementation got right. A non-overlapping
+    # pair used to come back WIDER than x, and a covering pair came back with
+    # negative width.
+    xs <- GRanges("chr1",
+                  IRanges(c(10L, 50L, 10L, 10L, 10L, 10L),
+                          c(20L, 60L, 20L, 20L, 30L, 30L)),
+                  strand = "*")
+    ys <- GRanges("chr1",
+                  IRanges(c(50L, 10L,  5L, 10L,  5L, 25L),
+                          c(60L, 20L, 30L, 20L, 15L, 40L)),
+                  strand = "*")
+    # shapes: disjoint-right, disjoint-left, cover, equal, left-edge, right-edge
+
+    for (keyed in c(FALSE, TRUE)) {
+        kx <- if (keyed) seq_along(xs) else NULL
+        q <- .gr_to_ddb(xs, keycol = kx)
+        s <- .gr_to_ddb(ys, keycol = kx)
+        got <- as(psetdiff(q, s), "GRanges")
+        want <- psetdiff(as(q, "GRanges"), as(s, "GRanges"))
+
+        expect_identical(start(got), start(want))
+        expect_identical(end(got), end(want))
+        expect_identical(width(got), width(want))
+        # a disjoint pair returns x untouched; a covering pair is zero width
+        expect_true(all(width(got) >= 0L))
+        expect_identical(width(got)[1:2], width(xs)[1:2])
+        expect_identical(width(got)[3:4], c(0L, 0L))
+    }
+})
+
+test_that("psetdiff only subtracts across compatible seqnames and strands", {
+    # base leaves x[i] untouched when the pair cannot be compared; the original
+    # implementation subtracted unconditionally, across chromosomes included.
+    xs <- GRanges(c("chr1", "chr1"), IRanges(c(10L, 10L), c(20L, 20L)),
+                  strand = c("+", "+"))
+    ys <- GRanges(c("chr2", "chr1"), IRanges(c(15L, 15L), c(25L, 25L)),
+                  strand = c("*", "-"))
+    q <- .gr_to_ddb(xs, keycol = seq_along(xs))
+    s <- .gr_to_ddb(ys, keycol = seq_along(ys))
+
+    got <- as(psetdiff(q, s), "GRanges")
+    want <- psetdiff(as(q, "GRanges"), as(s, "GRanges"))
+    expect_identical(start(got), start(want))
+    expect_identical(end(got), end(want))
+    expect_identical(width(got), width(xs))     # both pass through untouched
+
+    # ignore.strand re-enables the strand-incompatible pair (but not the
+    # seqname-incompatible one)
+    got2 <- as(psetdiff(q, s, ignore.strand = TRUE), "GRanges")
+    want2 <- psetdiff(as(q, "GRanges"), as(s, "GRanges"), ignore.strand = TRUE)
+    expect_identical(start(got2), start(want2))
+    expect_identical(end(got2), end(want2))
+
+    expect_error(psetdiff(q, s, ignore.strand = "yes"), "TRUE or FALSE")
+})
+
+test_that("psetdiff refuses a y strictly inside x, as base does", {
+    q <- .gr_to_ddb(GRanges("chr1", IRanges(10L, 30L)), keycol = 1L)
+    s <- .gr_to_ddb(GRanges("chr1", IRanges(15L, 20L)), keycol = 1L)
+    expect_error(psetdiff(as(q, "GRanges"), as(s, "GRanges")))   # base errors
+    expect_error(psetdiff(q, s), "strictly inside")
+})
+
+test_that("psetdiff is positional and does not coordinate-sort its result", {
+    # x is deliberately not in coordinate order; result[i] must stay x[i]-y[i].
+    xs <- GRanges("chr1", IRanges(c(500L, 100L, 300L), c(510L, 110L, 310L)))
+    ys <- GRanges("chr1", IRanges(c(505L, 999L, 999L), c(999L, 999L, 999L)))
+    q <- .gr_to_ddb(xs, keycol = seq_along(xs))
+    s <- .gr_to_ddb(ys, keycol = seq_along(ys))
+
+    got <- as(psetdiff(q, s), "GRanges")
+    want <- psetdiff(as(q, "GRanges"), as(s, "GRanges"))
+    expect_identical(start(got), start(want))
+    expect_identical(start(got), c(500L, 100L, 300L))
+})
+
 ### - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 ### Distance method tests
 ###
