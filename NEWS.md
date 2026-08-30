@@ -1,3 +1,29 @@
+# DuckDBGRanges 0.99.7
+
+## Testing
+
+- `checkDuckDBGRanges()` started failing on the Bioconductor build machines
+  (26 test failures, all "Attributes: < Component 'row.names': Modes:
+  character, numeric >") after `GenomicRanges` 1.65.2 rewrote
+  `as.data.frame.GenomicRanges()`: it used to default `row.names` to
+  `names(x)` when not supplied, and now hardcodes `row.names = NULL`
+  internally (an explicitly-passed `row.names` argument is silently
+  discarded too), putting `names(x)` in a new `names` column instead.
+  `checkDuckDBGRanges()`'s own `df <- as.data.frame(expected)` reference
+  assumed the old convention, so its row names stopped matching
+  `as.data.frame(object)`'s, which still carries real names as row names.
+  Not a `DuckDBGRanges` bug: confirmed by installing the exact upstream
+  commit and reproducing, then verifying `as.data.frame,DuckDBGRanges-method`
+  itself was unaffected, since it goes through `DuckDBDataFrame`'s own
+  conversion rather than `GenomicRanges`'s. Fixed by explicitly restoring
+  `rownames(df) <- names(expected)` and dropping the new `names` column
+  before comparing, which works against both old and new `GenomicRanges`.
+  The same fix landed in `BiocDuckDB`'s copy of this helper, and in
+  `BiocDuckDB::writeParquet.GenomicRanges()` itself, which had the same
+  reliance on the old convention and so silently wrote positional numbers
+  instead of real feature names as the `__name__` column whenever the
+  source `GenomicRanges` had real names.
+
 # DuckDBGRanges 0.99.6
 
 ## Bug fixes
