@@ -1,3 +1,9 @@
+# DuckDBGRanges 0.99.8
+
+## Documentation
+
+- Benchmarking vignette: cleaned up the prose in the results section.
+
 # DuckDBGRanges 0.99.7
 
 ## Testing

@@ -116,8 +116,9 @@ beneath the tables.
 
 # Results
 
-Rendered from the bundled offline results (`inst/scripts/benchmark_results.rds`);
-regenerate with `inst/scripts/run_vignette_benchmarks.R` (see that script's header).
+The tables below report the offline benchmark's measured timings, bundled with the
+package as `inst/scripts/benchmark_results.rds`. Regenerate them on your own
+hardware with `inst/scripts/run_vignette_benchmarks.R` (see that script's header).
 
 ```{r results, echo=FALSE, results='asis'}
 helper <- system.file("scripts", "make_timings_table.R", package = "DuckDBGRanges")
